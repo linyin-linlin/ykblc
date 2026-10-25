@@ -5,8 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#eef2f4" />
     <title>眼科病例册 | 广东省人民医院眼科</title>
-    <link rel="stylesheet" href="./styles.css?v=13" />
-    <script src="./app.js?v=13" defer></script>
+    <link rel="stylesheet" href="./styles.css?v=33" />
+    <script src="./app.js?v=33" defer></script>
+      <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
   </head>
   <body>
     <div class="app-shell">
@@ -42,7 +45,8 @@
             <label class="global-search" aria-label="搜索病例或医生">
               <input id="globalSearch" type="search" placeholder="搜索姓名、病案号、诊断或医生" autocomplete="off" />
             </label>
-            <button id="exportBtn" class="quiet-btn" type="button">导出数据</button>
+            <span id="syncStatus" class="sync-status is-busy" title="与电脑上的共享病例库自动同步，点一下可立即同步">正在连接…</span>
+          <button id="exportBtn" class="quiet-btn" type="button">导出数据</button>
             <button id="importBtn" class="quiet-btn" type="button" title="从电脑导出的 JSON 文件导入，用于换设备或同步">导入数据</button>
             <input id="importFile" class="hidden" type="file" accept=".json,application/json" />
             <button id="addRecordBtn" class="primary-btn" type="button">新增病例</button>
@@ -215,6 +219,21 @@
         <form id="recordForm">
           <input id="recordId" type="hidden" />
           <div class="form-scroll">
+<fieldset class="form-section" id="ocrSection">
+<legend>拍照 / 上传识别（打印病历、检查报告、PDF、Word）</legend>
+<div class="ocr-row">
+<button id="ocrPickBtn" class="quiet-btn" type="button">拍照 / 选文件</button>
+<input id="ocrFile" class="hidden" type="file" accept="image/*,application/pdf,.docx,.txt,.csv" />
+<button id="ocrRunBtn" class="primary-btn" type="button" disabled>开始识别</button>
+<span id="ocrStatus" class="ocr-status">还没有选图</span>
+</div>
+<img id="ocrPreview" class="ocr-preview hidden" alt="识别用图片" />
+<textarea id="ocrText" rows="5" placeholder="识别出的文字会出现在这里，可直接修改；再点下面「按识别结果填表」"></textarea>
+<div class="ocr-row">
+<button id="ocrFillBtn" class="primary-btn" type="button" disabled>按识别结果填表</button>
+<span class="ocr-hint">支持拍照、图片、PDF、Word(.docx)、txt；识别后自动填入空白项，文件也会存进本条记录的附件</span>
+</div>
+</fieldset>
             <label class="difficult-toggle"><input id="recordDifficult" type="checkbox" /><span>标记为疑难病例</span></label>
             <fieldset class="form-section">
               <legend>就诊信息</legend>
@@ -245,7 +264,7 @@
                 <label class="field span-3">主要诊断 <span class="required">*</span><input id="recordDiagnosis" type="text" placeholder="输入诊断名称" required /></label>
               <div class="field span-4"><span>次要诊断（可多个）</span><div class="tag-input"><input id="secondaryInput" type="text" placeholder="输入后回车或点添加" /><button type="button" class="mini-btn" id="addSecondaryBtn">添加</button></div><div id="secondaryList" class="tag-list"></div></div>
               </div>
-              <label class="field">主诉<textarea id="chiefComplaint" rows="2" placeholder="一句话，如：右眼视物模糊 3 天"></textarea></label>
+              <label class="field">主诉<textarea id="chiefComplaint" rows="2" placeholder="一句话，如：右眼视物模糊 3 天"></textarea></label><label class="field">既往病史<textarea id="pastHistory" rows="2" placeholder="如：否认高血压、糖尿病史；有手术史"></textarea></label>
             </fieldset>
 
             <fieldset class="form-section">
@@ -259,7 +278,7 @@
                 </div>
               </div>
 
-              <div class="exam-vitals">
+              <div class="vital-legend">参考：眼压 10-21 mmHg；视力 ≥1.0 正常，0.1-0.9 偏低（橙），<0.1 或 手动/指数/光感 明显异常（红）。文本框会随内容自动长高。</div><div class="exam-vitals">
                 <label class="vital">裸眼视力 OD<input id="examVisionOd" type="text" list="visionOptions" placeholder="1.0" /></label>
                 <label class="vital">裸眼视力 OS<input id="examVisionOs" type="text" list="visionOptions" placeholder="1.0" /></label>
                 <label class="vital">矫正视力 OD<input id="examVisionCorrOd" type="text" list="visionOptions" placeholder="1.0" /></label>
