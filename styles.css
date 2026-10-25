@@ -612,3 +612,29 @@ p { margin: 0; }
 /* hide green eyebrow line on every page */
 .eyebrow { display: none !important; }
 .page-header h1 { margin-top: 0; }
+/* ---------- 拍照识别 ---------- */
+.ocr-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 4px 0 10px; }
+.ocr-status { font-size: 13px; color: var(--ink-soft); }
+.ocr-hint { font-size: 12px; color: var(--ink-faint); }
+.ocr-preview { display: block; max-width: 220px; max-height: 170px; border: 1px solid var(--line); border-radius: var(--radius-sm); margin: 4px 0 10px; }
+#ocrText { width: 100%; }
+/* 文本框随内容长高 + 异常值标注 */
+#examDetails { overflow: hidden; resize: vertical; }
+input.abn-sev { color: #c62828 !important; font-weight: 800 !important; background: #fff2f2 !important; border-color: #e57373 !important; }
+input.abn-warn { color: #b26a00 !important; font-weight: 700 !important; background: #fff8e6 !important; border-color: #e0a94a !important; }
+.vital-legend { flex-basis: 100%; font-size: 12px; color: #7a7a7a; margin: 2px 0 6px; line-height: 1.5; }
+/* 查体速览高亮 */
+.exam-highlight { margin-top: 6px; padding: 6px 8px; font-size: 12px; line-height: 1.9; color: #3d3d3d; background: #fbfbfb; border: 1px dashed #dcdcdc; border-radius: 6px; }
+.exam-highlight:empty { display: none; padding: 0; border: none; }
+.exam-highlight-title { font-size: 11px; color: #8a8a8a; margin-bottom: 3px; }
+.exam-highlight mark.kw-bad { background: #ffe3e3; color: #c62828; font-weight: 700; padding: 0 2px; border-radius: 3px; }
+.exam-highlight mark.kw-good { background: #e8f5e9; color: #2e7d32; padding: 0 2px; border-radius: 3px; }
+/* 既往病史框也随内容长高 */
+#examDetails, #pastHistory { overflow: hidden; resize: vertical; }
+/* 次要诊断标注更明显 */
+#secondaryList .tag, #secondaryList > span { font-weight: 800 !important; color: #b26a00 !important; background: #fff4e5 !important; border-color: #e0a94a !important; }
+#secondaryList .tag { font-size: 13.5px !important; padding: 3px 8px !important; }
+/* 同步状态提示 */
+.sync-status { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; font-size: 12px; line-height: 1; color: #1f6f43; background: #e8f6ee; border: 1px solid #bfe4cf; white-space: nowrap; cursor: pointer; user-select: none; }
+.sync-status.is-busy { color: #8a6100; background: #fff6e0; border-color: #f0dca8; }
+.sync-status.is-off { color: #8a2c2c; background: #fdeceb; border-color: #f3c8c5; }

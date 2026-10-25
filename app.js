@@ -243,7 +243,7 @@ function getFilteredRecords(type, sort) {
   sort = sort || "latest";
   const query = $("#globalSearch").value.trim().toLowerCase();
   const list = records.filter(function (r) {
-    const haystack = [r.name, r.patientNo, r.diagnosis, r.notes, r.chiefComplaint, r.surgeryName, r.examDetails, r.auxExam, r.postopExam, r.surgeon, r.attendingDoctor, r.generalAdmission, r.generalAfter, (r.secondaryDiagnoses || []).join(" ")].concat(r.tags || []).join(" ").toLowerCase();
+    const haystack = [r.name, r.patientNo, r.diagnosis, r.notes, r.chiefComplaint, r.pastHistory, r.surgeryName, r.examDetails, r.auxExam, r.postopExam, r.surgeon, r.attendingDoctor, r.generalAdmission, r.generalAfter, (r.secondaryDiagnoses || []).join(" ")].concat(r.tags || []).join(" ").toLowerCase();
     const typeMatch = type === "全部" || r.type === type || (type === "随访" && r.followupDate) || (type === "疑难" && Boolean(r.difficult));
     const dateMatch = !dateFilter || r.date === dateFilter;
     return typeMatch && dateMatch && (!query || haystack.indexOf(query) >= 0);
@@ -342,7 +342,7 @@ function renderMetrics() {
 }
 
 function renderDashboard() {
-  const recent = getFilteredRecords("全部").slice(0, 6);
+  const _recentAll = getFilteredRecords("全部"); _recentAll.sort(function (a, b) { return createdValue(b.createdAt) - createdValue(a.createdAt); }); const recent = _recentAll.slice(0, 6);
   $("#recentList").innerHTML = recent.length ? recent.map(recordRow).join("") : emptyState("暂时没有病例", "先新增一条病例记录");
   const groups = diagnosisSummary().sort(function (a, b) { return b.records.length - a.records.length; }).slice(0, 5);
   $("#diagnosisMini").innerHTML = groups.length
@@ -540,7 +540,7 @@ function openForm(record) {
   setField("patientGender", record ? record.gender : "女");
   setField("patientAge", record ? record.age : "");
   setField("recordDiagnosis", record ? record.diagnosis : "");
-  setField("chiefComplaint", record ? record.chiefComplaint : "");
+  setField("chiefComplaint", record ? record.chiefComplaint : ""); setField("pastHistory", record ? (record.pastHistory || "") : "");
   setField("treatment", record ? record.treatment : "观察");
   setField("recordTags", record ? (record.tags || []).join(", ") : "");
   setField("surgeryName", record ? record.surgeryName : "");
@@ -580,7 +580,7 @@ function handleSubmit(event) {
     age: $("#patientAge").value ? Number($("#patientAge").value) : "",
     eye: $("#recordEye").value, difficult: Boolean($("#recordDifficult").checked),
     diagnosis: $("#recordDiagnosis").value.trim(),
-    chiefComplaint: $("#chiefComplaint").value.trim(),
+    chiefComplaint: $("#chiefComplaint").value.trim(), pastHistory: $("#pastHistory").value.trim(),
     exams: $$("[data-exam]").filter(function (c) { return c.checked; }).map(function (c) { return c.value; }),
     examQuick: cloneExam(examState),
     examDetails: composeExamText(),
@@ -601,10 +601,10 @@ function handleSubmit(event) {
   }
   if (existing) {
     const index = records.findIndex(function (r) { return r.id === existing; });
-    if (index >= 0) records[index] = Object.assign({}, records[index], record);
-    else records.unshift(record);
+    if (index >= 0) { records[index] = Object.assign({}, records[index], record); records[index].createdAt = new Date().toISOString(); }
+    else { record.createdAt = record.createdAt || new Date().toISOString(); records.unshift(record); }
   } else {
-    records.unshift(record);
+    record.createdAt = record.createdAt || new Date().toISOString(); records.unshift(record);
   }
   saveRecords();
   rememberExam();
@@ -640,7 +640,7 @@ function openDetail(id) {
       detailRow("病案号", r.patientNo) +
       detailRow("性别 / 年龄", (r.gender || "未记录") + " / " + (r.age === "" || r.age == null ? "未记录" : r.age + " 岁")) +
       detailRow("主要诊断", r.diagnosis) +
-      detailRow("主诉", r.chiefComplaint) +
+      detailRow("主诉", r.chiefComplaint) + detailRow("既往病史", r.pastHistory) +
     "</div>" +
     '<div class="detail-section"><h3>专科查体</h3>' +
       detailRow("检查项目", (r.exams || []).join("、")) +
@@ -1328,3 +1328,844 @@ function importRecordsFromFile(file) {
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", bind);
   else bind();
 })();
+/* ---------------- 拍照 / 文件识别 → 自动填表（打印病历、报告、PDF、Word） ---------------- */
+var OCR_ENGINE = {
+  script: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/tesseract.min.js",
+  worker: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/worker.min.js",
+  core: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.0/",
+  lang: "https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0"
+};
+var OCR_LIBS = {
+  pdf: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.min.js",
+  pdfWorker: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.worker.min.js",
+  zip: "https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"
+};
+var OCR_MIRRORS = ["https://cdn.jsdelivr.net/npm/", "https://fastly.jsdelivr.net/npm/", "https://unpkg.com/"];
+var ocrActiveBase = OCR_MIRRORS[0];
+function ocrPaths(base, kind) {
+  if (kind === "engine") return base + "tesseract.js@5.1.0/dist/tesseract.min.js";
+  if (kind === "worker") return base + "tesseract.js@5.1.0/dist/worker.min.js";
+  if (kind === "core") return base + "tesseract.js-core@5.1.0/";
+  if (kind === "lang") return base + "@tesseract.js-data/chi_sim@1.0.0/4.0.0";
+  if (kind === "pdf") return base + "pdfjs-dist@3.11.174/legacy/build/pdf.min.js";
+  if (kind === "pdfWorker") return base + "pdfjs-dist@3.11.174/legacy/build/pdf.worker.min.js";
+  if (kind === "zip") return base + "jszip@3.10.1/dist/jszip.min.js";
+  return "";
+}
+function ocrLoadScript(url) {
+  return new Promise(function (resolve, reject) {
+    var tag = document.createElement("script");
+    tag.src = url;
+    tag.onload = function () { resolve(); };
+    tag.onerror = function () { reject(new Error("脚本下载失败")); };
+    document.head.appendChild(tag);
+  });
+}
+function ocrWithTimeout(promise, ms, message) {
+  return new Promise(function (resolve, reject) {
+    var timer = setTimeout(function () { reject(new Error(message || "下载超时")); }, ms);
+    promise.then(function (v) { clearTimeout(timer); resolve(v); }, function (e) { clearTimeout(timer); reject(e); });
+  });
+}
+function ocrTryMirrors(step, i) {
+  if (i >= OCR_MIRRORS.length) return Promise.reject(new Error("所有下载源都失败了，请检查网络后重试"));
+  ocrActiveBase = OCR_MIRRORS[i];
+  return step(OCR_MIRRORS[i]).catch(function (error) {
+    if (i + 1 < OCR_MIRRORS.length) { ocrSay("这个下载源太慢，正在换下一个…"); }
+    return ocrTryMirrors(step, i + 1);
+  });
+}
+function ocrLoadLibAny(kind, ready) {
+  if (ready()) return Promise.resolve();
+  return ocrTryMirrors(function (base) {
+    return ocrWithTimeout(ocrLoadScript(ocrPaths(base, kind)), 45000, "组件下载超时").then(function () { if (!ready()) throw new Error("组件加载异常"); });
+  }, 0);
+}
+var ocrImage = null;
+var ocrAttached = false;
+var ocrEnginePromise = null;
+var ocrLibPromises = {};
+var ocrLastFill = {}; var ocrLastTick = 0; var ocrWatchTimer = null; var ocrInit = {};
+function ocrById(id) { return document.getElementById(id); }
+function ocrSay(text) { var el = ocrById("ocrStatus"); if (el) el.textContent = text; }
+function ocrReset() {
+  ocrImage = null;
+  ocrAttached = false;
+  ocrLastFill = {};
+  var preview = ocrById("ocrPreview");
+  if (preview) {
+    if (preview.dataset && preview.dataset.url) { try { URL.revokeObjectURL(preview.dataset.url); } catch (error) {} }
+    preview.removeAttribute("src");
+    preview.classList.add("hidden");
+  }
+  var text = ocrById("ocrText"); if (text) text.value = "";
+  var runBtn = ocrById("ocrRunBtn"); if (runBtn) runBtn.disabled = true;
+  var fillBtn = ocrById("ocrFillBtn"); if (fillBtn) fillBtn.disabled = true;
+  ocrSay("还没有选择文件");
+}
+function ocrLoadEngine() {
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (ocrEnginePromise) return ocrEnginePromise;
+  ocrEnginePromise = new Promise(function (resolve, reject) {
+    var tag = document.createElement("script");
+    tag.src = OCR_ENGINE.script;
+    tag.onload = function () { if (window.Tesseract) { resolve(window.Tesseract); } else { reject(new Error("识别引擎加载异常")); } };
+    tag.onerror = function () { ocrEnginePromise = null; reject(new Error("识别引擎下载失败，请检查网络")); };
+    document.head.appendChild(tag);
+  });
+  return ocrEnginePromise;
+}
+function ocrLoadLib(key, url, ready) {
+  if (ready()) return Promise.resolve();
+  if (ocrLibPromises[key]) return ocrLibPromises[key];
+  ocrLibPromises[key] = new Promise(function (resolve, reject) {
+    var tag = document.createElement("script");
+    tag.src = url;
+    tag.onload = function () { if (ready()) { resolve(); } else { reject(new Error("组件加载异常")); } };
+    tag.onerror = function () { ocrLibPromises[key] = null; reject(new Error("组件下载失败，请检查网络")); };
+    document.head.appendChild(tag);
+  });
+  return ocrLibPromises[key];
+}
+function ocrProgress(info) { ocrLastTick = Date.now();
+  var percent = Math.round((info.progress || 0) * 100);
+  var names = {
+    "loading tesseract core": "加载识别引擎",
+    "initializing tesseract": "初始化引擎",
+    "loading language traineddata": "下载中文模型（首次约 20MB）",
+    "initializing api": "准备识别",
+    "recognizing text": "正在识别文字"
+  };
+  ocrSay((names[info.status] || "处理中") + " " + percent + "%");
+}
+function ocrFileKind(file) {
+  var name = (file.name || "").toLowerCase();
+  var type = (file.type || "").toLowerCase();
+  if (type.indexOf("image/") === 0 || /\.(jpe?g|png|webp|bmp|gif|heic|heif)$/.test(name)) return "image";
+  if (type === "application/pdf" || /\.pdf$/.test(name)) return "pdf";
+  if (/\.docx$/.test(name) || type.indexOf("wordprocessingml") >= 0) return "docx";
+  if (/\.(txt|csv|md|json|xml)$/.test(name) || type.indexOf("text/") === 0) return "text";
+  return "other";
+}
+function ocrReadTextFile(file) {
+  return new Promise(function (resolve, reject) {
+    var reader = new FileReader();
+    reader.onload = function () { resolve(String(reader.result || "")); };
+    reader.onerror = function () { reject(new Error("文件读取失败")); };
+    reader.readAsText(file, "utf-8");
+  });
+}
+function ocrDocxText(file) {
+  return ocrLoadLibAny("zip", function () { return typeof window.JSZip !== "undefined"; }).then(function () {
+    return window.JSZip.loadAsync(file);
+  }).then(function (zip) {
+    var entry = zip.file("word/document.xml");
+    if (!entry) throw new Error("没找到 Word 正文（.doc 旧格式需先另存为 .docx）");
+    return entry.async("string");
+  }).then(function (xml) {
+    return String(xml).replace(/<w:p[ >]/g, "\n<w:p ").replace(/<w:tab\/>/g, " ").replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
+  });
+}
+function ocrPdfScannedText(pdf, maxPages) {
+  var out = [];
+  var chain = ocrLoadEngine();
+  for (var p = 1; p <= maxPages; p++) {
+    (function (pageNo) {
+      chain = chain.then(function () {
+        return pdf.getPage(pageNo).then(function (page) {
+          var base = page.getViewport({ scale: 1 });
+          var scale = Math.min(3, 2000 / Math.max(1, base.width));
+          var viewport = page.getViewport({ scale: scale });
+          var canvas = document.createElement("canvas");
+          canvas.width = Math.round(viewport.width);
+          canvas.height = Math.round(viewport.height);
+          var ctx = canvas.getContext("2d");
+          return page.render({ canvasContext: ctx, viewport: viewport }).promise.then(function () {
+            return new Promise(function (resolve) { canvas.toBlob(function (blob) { resolve(blob); }, "image/png"); });
+          });
+        }).then(function (blob) {
+          ocrSay("扫描件第 " + pageNo + " 页：正在识别文字…");
+          return window.Tesseract.recognize(blob, "chi_sim", { workerPath: ocrPaths(ocrActiveBase, "worker"), corePath: ocrPaths(ocrActiveBase, "core"), langPath: ocrPaths(ocrActiveBase, "lang"), logger: ocrProgress });
+        }).then(function (result) {
+          out.push(result && result.data && result.data.text ? result.data.text : "");
+        });
+      });
+    })(p);
+  }
+  return chain.then(function () { return out.join("\n"); });
+}
+function ocrPdfText(file) {
+  return ocrLoadLibAny("pdf", function () { return typeof window.pdfjsLib !== "undefined"; }).then(function () {
+    return fetch(ocrPaths(ocrActiveBase, "pdfWorker")).then(function (res) { return res.text(); }).then(function (code) {
+      if (window.pdfjsLib.GlobalWorkerOptions) { window.pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([code], { type: "application/javascript" })); }
+    }).catch(function () {
+      if (window.pdfjsLib.GlobalWorkerOptions) { window.pdfjsLib.GlobalWorkerOptions.workerSrc = OCR_LIBS.pdfWorker; }
+    });
+  }).then(function () {
+    return file.arrayBuffer();
+  }).then(function (buffer) {
+    return window.pdfjsLib.getDocument({ data: buffer }).promise;
+  }).then(function (pdf) {
+    var maxPages = Math.min(pdf.numPages, 5);
+    var parts = [];
+    var chain = Promise.resolve();
+    var meaningful = 0;
+    for (var p = 1; p <= maxPages; p++) {
+      (function (pageNo) {
+        chain = chain.then(function () {
+          return pdf.getPage(pageNo).then(function (page) { return page.getTextContent(); }).then(function (content) {
+            var items = (content.items || []); var buf = []; var lastY = null; items.forEach(function (it) { var yy = it.transform && it.transform.length > 5 ? Math.round(it.transform[5]) : null; if (lastY === null || yy === null || Math.abs(yy - lastY) > 3) { buf.push(it.str || ""); lastY = yy; } else { buf[buf.length - 1] += (it.str || ""); } }); var line = buf.join("\n");
+            if (line.replace(/\s/g, "").length > 15) meaningful++;
+            parts.push(line);
+          });
+        });
+      })(p);
+    }
+    return chain.then(function () {
+      if (meaningful === 0) { return ocrPdfScannedText(pdf, maxPages); }
+      return parts.join("\n");
+    });
+  }).catch(function (error) {
+    throw error && error.message ? error : new Error("PDF 解析失败（加密文件需先解密）");
+  });
+}
+function ocrClean(text) {
+  var src = String(text || "");
+  src = src.replace(/[\u3000\u00a0]/g, " "); src = src.replace(/[“”"']/g, "");
+  src = src.replace(/([\u4e00-\u9fa5。，、；：（）【】“”《》])[ ]+(?=[\u4e00-\u9fa5。，、；：（）【】“”《》])/g, "$1");
+  src = src.replace(/[ \t]+/g, " ");
+  return src;
+}
+function ocrFixDate(year, month, day) {
+  var y = Number(year), m = Number(month), d = Number(day);
+  if (!y || !m || !d || m > 12 || d > 31) return "";
+  return String(y) + "-" + (m < 10 ? "0" : "") + m + "-" + (d < 10 ? "0" : "") + d;
+}
+function ocrDateNear(src, labelRe) {
+  var scope = src;
+  if (labelRe) {
+    var hit = src.match(labelRe);
+    if (!hit) return "";
+    scope = src.slice(hit.index, hit.index + 80);
+  }
+  var m = scope.match(/(20\d{2})\s*[-\/年.]\s*(\d{1,2})\s*[-\/月.]\s*(\d{1,2})/);
+  return m ? ocrFixDate(m[1], m[2], m[3]) : "";
+}
+function ocrTrimValue(value) {
+  return String(value || "").split(/\s{2,}|(?=\s*20\d{2}\s*[-/年.])|\s(?=(?:姓名|性别|年龄|门诊号|住院号|病案号|眼别|术眼|患眼|就诊|主诉|现病史|既往史|诊断|手术|随访|复诊|复查|预约|下次|治疗|处理|医嘱|主管|主刀|术者|医师|医生|记录|签名|日期|时间|电话|地址|联系|住院|门诊|病案|病历))|(?=\s*(?:姓名|性别|年龄|门诊号|住院号|病案号|病历号|就诊日期|就诊时间|就诊类型|就诊方式|眼别|术眼|患眼|主诉|现病史|既往史|主要诊断|次要诊断|其他诊断|伴随诊断|手术名称|手术方式|手术日期|手术时间|随访日期|复诊日期|下次随访|预约日期|复查日期|治疗方式|治疗方案|处理意见|主管医生|主管医师|主刀医师|主刀医生|术者|记录者|医师)\s*[:：;；])/)[0].replace(/[，,。;；、]+$/, "").trim();
+}
+function ocrParse(rawText) {
+  var src = ocrClean(rawText);
+  var pick = function (re) { var m = src.match(re); return m && m[1] ? ocrTrimValue(m[1]) : ""; };
+  var out = {};
+  out.patientName = pick(/(?:姓名|患者姓名|病人姓名)\s*[:：;；,，]?\s*([一-龥·]{2,4}?)(?=\s*(?:性别|年龄|门诊|住院|病案|病历|眼别|就诊|主诉|诊断|手术|随访|主管|主刀|治疗|联系|电话|地址|科别|床号|日期|时间|岁)|[\s（(【:：;；]|$)/);
+  var gender = pick(/性别\s*[:：;；,，]?\s*(男|女)/);
+  if (gender) out.patientGender = gender;
+  out.patientAge = pick(/(?:年龄|年纪)\s*[:：;；,，]?\s*(\d{1,3})/);
+  if (!out.patientAge) { var ageAny = src.match(/(\d{1,3})\s*(?:岁|周岁)/); if (ageAny) out.patientAge = ageAny[1]; }
+  out.patientNo = pick(/(?:住院号|病案号|病历号|门诊号|就诊号|登记号|ID)\s*[:：;；,，]?\s*([A-Za-z0-9\-]{3,24})/);
+  out.encounterDate = ocrDateNear(src, /(?:就诊日期|就诊时间|门诊日期|入院日期|检查日期|报告日期)/) || ocrDateNear(src, null);
+  var visitType = pick(/(?:就诊类型|就诊方式|就诊类别|门诊类型)\s*[:：;；,，]?\s*(门诊|急诊|住院|随访)/);
+  if (visitType) out.encounterType = visitType;
+  var second = pick(/(?:次要诊断|其他诊断|伴随诊断|并发诊断)\s*[:：;；,，]?\s*([^\n\r]{2,60})/);
+  if (second) {
+    out.secondary = second.split(/[、,，;；]/).map(function (item) { return ocrCutDiagnosis(ocrTrimValue(item)); }).filter(function (item) { return item.length > 1; });
+    src = src.replace(/(?:次要诊断|其他诊断|伴随诊断|并发诊断)\s*[:：;；,，]?\s*[^\n\r]{2,60}/, " ");
+  }
+  out.recordDiagnosis = pick(/(?:主要诊断|初步诊断|门诊诊断|出院诊断|入院诊断|诊断)\s*[:：;；,，]?\s*([^\n\r]{2,48})/); out.recordDiagnosis = ocrCutDiagnosis(out.recordDiagnosis);
+  out.chiefComplaint = pick(/主诉\s*[:：;；,，]?\s*([^\n\r]{2,80}?)(?=\s*(?:现病史|既往史|专科查体|查体|辅助检查|处理意见|处理|医嘱|主要诊断|次要诊断|初步诊断|其他诊断|伴随诊断|手术名称|手术日期|随访日期|诊断|手术|随访|复诊|日期|时间)|[\n\r]|$)/);
+  out.attendingDoctor = pick(/(?:主管医生|主管医师|经治医师|接诊医师)\s*[:：;；,，]?\s*([一-龥]{2,4}?)(?=\s*(?:随访|复诊|下次|预约|复查|手术|诊断|治疗|日期|时间|电话|联系|医师|医生|签名|记录|主刀|主管|住院|门诊|岁)|[\s（(【:：;；]|$)/);
+  out.surgeon = pick(/(?:主刀医师|主刀医生|术者|手术医师)\s*[:：;；,，]?\s*([一-龥]{2,4}?)(?=\s*(?:随访|复诊|下次|预约|复查|手术|诊断|治疗|日期|时间|电话|联系|医师|医生|签名|记录|主管|住院|门诊|岁)|[\s（(【:：;；]|$)/);
+  out.surgeryName = pick(/(?:手术名称|手术方式|术式|拟行手术|拟施手术)\s*[:：;；,，]?\s*([^\n\r]{2,40})/);
+  out.surgeryDate = ocrDateNear(src, /(?:手术日期|手术时间|手术日)/);
+  out.followupDate = ocrDateNear(src, /(?:随访日期|复诊日期|下次随访|预约日期|复查日期)/);
+  var plan = pick(/(?:治疗方式|治疗方案|处理意见|处理)\s*[:：;；,，]?\s*([^\n\r]{2,24})/);
+  if (plan) {
+    if (/手术/.test(plan)) { out.treatmentType = "手术治疗"; out.treatment = "手术治疗"; }
+    else if (/激光/.test(plan)) { out.treatmentType = "保守治疗"; out.treatment = "激光治疗"; }
+    else if (/注射|打针/.test(plan)) { out.treatmentType = "保守治疗"; out.treatment = "注射治疗"; }
+    else if (/药物|用药|滴眼/.test(plan)) { out.treatmentType = "保守治疗"; out.treatment = "药物治疗"; }
+    else if (/观察|随诊/.test(plan)) { out.treatmentType = "保守治疗"; out.treatment = "观察"; }
+    else if (/转诊|转院/.test(plan)) { out.treatmentType = "保守治疗"; out.treatment = "转诊"; }
+  }
+  var eye = pick(/(?:眼别|术眼|手术眼|患眼)\s*[:：;；,，]?\s*(右眼|左眼|双眼|OD|OS|OU)/) || pick(/(右眼|左眼|双眼)/);
+  if (eye) {
+    if (/右眼|OD/i.test(eye)) out.recordEye = "OD";
+    else if (/左眼|OS/i.test(eye)) out.recordEye = "OS";
+    else if (/双眼|OU/i.test(eye)) out.recordEye = "OU";
+  }
+  return out;
+}
+function ocrSetField(id, value) {
+  if (!value) return false;
+  var el = ocrById(id);
+  if (!el) return false;
+  var current = String(el.value || "").trim();
+  var mine = ocrLastFill[id];
+  if (el.tagName === "SELECT") {
+    var untouched = (el.selectedIndex <= 0);
+    if (!untouched && current && current !== mine && current !== ocrInit[id]) return false;
+    var matched = "";
+    for (var i = 0; i < el.options.length; i++) {
+      if (el.options[i].value === value || el.options[i].text === value) { matched = el.options[i].value; break; }
+    }
+    if (!matched) return false;
+    if (el.value === matched) { ocrLastFill[id] = matched; return false; }
+    el.value = matched;
+  } else {
+    if (current && current !== mine && current !== ocrInit[id]) return false;
+    el.value = value;
+  }
+  ocrLastFill[id] = String(el.value);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}
+function ocrAttachPhoto() {
+  if (!ocrImage || ocrAttached) return false;
+  try {
+    if (typeof pendingFiles === "undefined" || !pendingFiles || typeof pendingFiles.push !== "function") return false;
+    var stamp = new Date();
+    var two = function (n) { return n < 10 ? "0" + n : "" + n; };
+    var ext = ocrImage.name && /\./.test(ocrImage.name) ? ocrImage.name.slice(ocrImage.name.lastIndexOf(".")) : ".jpg";
+    var name = "病历文件-" + stamp.getFullYear() + two(stamp.getMonth() + 1) + two(stamp.getDate()) + "-" + two(stamp.getHours()) + two(stamp.getMinutes()) + two(stamp.getSeconds()) + ext;
+    var type = ocrImage.type || "application/octet-stream";
+    pendingFiles.push(new File([ocrImage], name, { type: type }));
+    if (typeof renderAttachList === "function") renderAttachList();
+    ocrAttached = true;
+    return true;
+  } catch (error) { return false; }
+}
+function ocrFill(auto) {
+  var box = ocrById("ocrText");
+  var data = ocrParse(box ? box.value : ""); ocrApplyReal(data, box ? box.value : "");
+  var pairs = [
+    ["姓名", "patientName", data.patientName],
+    ["性别", "patientGender", data.patientGender],
+    ["年龄", "patientAge", data.patientAge],
+    ["病案号", "patientNo", data.patientNo],
+    ["就诊日期", "encounterDate", data.encounterDate],
+    ["就诊类型", "encounterType", data.encounterType],
+    ["主要诊断", "recordDiagnosis", data.recordDiagnosis],
+    ["主诉", "chiefComplaint", data.chiefComplaint],
+    ["主管医生", "attendingDoctor", data.attendingDoctor],
+    ["主刀医师", "surgeon", data.surgeon],
+    ["手术名称", "surgeryName", data.surgeryName],
+    ["手术日期", "surgeryDate", data.surgeryDate],
+    ["随访日期", "followupDate", data.followupDate],
+    ["治疗类型", "treatmentType", data.treatmentType],
+    ["治疗方式", "treatment", data.treatment]
+  ];
+  pairs = pairs.concat(ocrExtraPairs(box ? box.value : "")); var filled = [];
+  pairs.forEach(function (item) { if (ocrSetField(item[1], item[2])) filled.push(item[0]); });
+  if (data.recordEye) {
+    var eyeEl = ocrById("recordEye");
+    var eyeMine = ocrLastFill["recordEye"];
+    if (eyeEl && eyeEl.value !== data.recordEye && (!String(eyeEl.value || "").trim() || eyeEl.value === eyeMine || eyeEl.selectedIndex <= 0 || eyeEl.value === "OU")) {
+      eyeEl.value = data.recordEye;
+      ocrLastFill["recordEye"] = data.recordEye;
+      eyeEl.dispatchEvent(new Event("change", { bubbles: true }));
+      filled.push("眼别");
+    }
+  }
+  if (data.secondary && data.secondary.length && typeof secondaryDiagnoses !== "undefined" && secondaryDiagnoses && typeof secondaryDiagnoses.push === "function") {
+    data.secondary.forEach(function (name) {
+      if (secondaryDiagnoses.indexOf(name) < 0) { secondaryDiagnoses.push(name); filled.push("次要诊断" + name); }
+    });
+    if (typeof renderSecondary === "function") renderSecondary();
+  }
+  var attached = ocrAttachPhoto();
+  if (!filled.length) { if (!auto) { toast("没有可填入的空白字段（已填内容不会被覆盖）"); } ocrSay("识别到的内容没对上空白字段，或对应字段已经填过"); return 0; }
+  var summary = "已填入 " + filled.length + " 项：" + filled.slice(0, 8).join("、") + (filled.length > 8 ? " 等" : "") + (attached ? "；文件已存进附件" : "");
+  if (!auto) { toast(summary); }
+  ocrSay(summary + "。请核对后保存。");
+  return filled.length;
+}
+function ocrStart() {
+  if (!ocrImage) { toast("请先拍照或选择病历文件"); return; }
+  var kind = ocrFileKind(ocrImage);
+  var runBtn = ocrById("ocrRunBtn");
+  var fillBtn = ocrById("ocrFillBtn");
+  if (runBtn) runBtn.disabled = true;
+  if (fillBtn) fillBtn.disabled = true;
+  ocrLastFill = {};
+  var job; if (ocrWatchTimer) { clearInterval(ocrWatchTimer); } ocrLastTick = Date.now(); ocrWatchTimer = setInterval(function () { if (ocrLastTick && Date.now() - ocrLastTick > 45000) { ocrSay("组件下载较慢（已 45 秒没有进展）——可以再等一会儿，或重新点「开始识别 / 读取」重试。"); } }, 10000);
+  if (kind === "image") {
+    ocrSay("正在准备识别…");
+    job = ocrTryMirrors(function (base) {
+      return ocrLoadScript(ocrPaths(base, "engine")).then(function () { return ocrLoadEngine(); }).then(function (engine) {
+        return ocrWithTimeout(engine.recognize(ocrImage, "chi_sim", { workerPath: ocrPaths(base, "worker"), corePath: ocrPaths(base, "core"), langPath: ocrPaths(base, "lang"), logger: ocrProgress }), 150000, "识别组件下载超时");
+      }).then(function (result) { return result && result.data ? result.data.text : ""; });
+    }, 0);
+  } else if (kind === "pdf") {
+    ocrSay("正在读取 PDF…");
+    job = ocrPdfText(ocrImage);
+  } else if (kind === "docx") {
+    ocrSay("正在读取 Word 文档…");
+    job = ocrDocxText(ocrImage);
+  } else if (kind === "text") {
+    ocrSay("正在读取文本文件…");
+    job = ocrReadTextFile(ocrImage);
+  } else {
+    job = Promise.reject(new Error("暂不支持这种文件（请用图片、PDF、.docx 或 txt）"));
+  }
+  job.then(function (text) {
+    var clean = String(text || "").trim();
+    var box = ocrById("ocrText");
+    if (box) box.value = clean;
+    if (!clean) { ocrSay("没能从文件里读出文字（可能是空白页或加密文件）"); toast("没有读到文字"); return; }
+    var count = clean.replace(/\s/g, "").length;
+    ocrSay("已取到 " + count + " 字，正在自动填表…");
+    var filledCount = ocrFill(true);
+    if (fillBtn) fillBtn.disabled = false;
+    if (!filledCount) { ocrSay("已取到 " + count + " 字，但没对上可填的空白字段，请在下面文字里核对"); }
+  }).catch(function (error) {
+    var message = error && error.message ? error.message : "未知错误";
+    ocrSay("读取失败：" + message);
+    toast("读取失败：" + message);
+  }).then(function () { if (runBtn) runBtn.disabled = false; if (ocrWatchTimer) { clearInterval(ocrWatchTimer); ocrWatchTimer = null; } });
+}
+(function initOcrPanel() {
+  function bind() {
+    var pickBtn = ocrById("ocrPickBtn");
+    var fileInput = ocrById("ocrFile");
+    var runBtn = ocrById("ocrRunBtn");
+    var fillBtn = ocrById("ocrFillBtn");
+    if (!pickBtn || !fileInput) return;
+    pickBtn.addEventListener("click", function () { fileInput.click(); });
+    fileInput.addEventListener("change", function (event) {
+      var file = event.target.files && event.target.files[0];
+      event.target.value = "";
+      if (!file) return;
+      ocrImage = file;
+      ocrAttached = false;
+      var preview = ocrById("ocrPreview");
+      if (preview && /^image\//.test(file.type || "")) {
+        if (preview.dataset && preview.dataset.url) { try { URL.revokeObjectURL(preview.dataset.url); } catch (error) {} }
+        var url = URL.createObjectURL(file);
+        preview.dataset.url = url;
+        preview.src = url;
+        preview.classList.remove("hidden");
+      } else if (preview) {
+        preview.classList.add("hidden");
+      }
+      if (runBtn) runBtn.disabled = false;
+      if (fillBtn) fillBtn.disabled = true;
+      ocrSay("已选择文件：" + file.name + "，点「开始识别 / 读取」");
+    });
+    if (runBtn) runBtn.addEventListener("click", ocrStart);
+    if (fillBtn) fillBtn.addEventListener("click", function () { ocrFill(false); });
+    var addBtn = ocrById("addRecordBtn");
+    if (addBtn) addBtn.addEventListener("click", function () { setTimeout(ocrReset, 0); if (typeof ocrSnapshotInit === "function") { setTimeout(ocrSnapshotInit, 80); } });
+    var form = ocrById("recordForm");
+    if (form) form.addEventListener("submit", function () { setTimeout(ocrReset, 400); });
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", bind);
+  else bind();
+})();
+/* ---------------- 扩展字段：查体 / 辅助检查 / 一般情况 / 麻醉 / 术后 等 ---------------- */
+function ocrCutDiagnosis(value) {
+  var s = String(value || "");
+  s = s.split(/[。；;]/)[0];
+  var hit = s.search(/(?:后于|后在我院|于我院|来我院|我院|术后|入院|出院|门诊|给予|予以|建议|复查|复诊|随诊|随访|治疗|检查|手术)/);
+  if (hit > 1) { s = s.slice(0, hit); }
+  s = s.replace(/\s+/g, "");
+  return s.slice(0, 32);
+}
+function ocrParseExtra(raw) {
+  var src = ocrClean(raw);
+  var pick = function (re) { var m = src.match(re); return m && m[1] ? ocrTrimValue(m[1]) : ""; };
+  var pickLong = function (re) { var m = src.match(re); return m && m[1] ? String(m[1]).replace(/\s+$/, "").slice(0, 900) : ""; };
+  var out = {};
+  out.examVisionOd = pick(/(?:右眼视力|视力\(右\)|视力（右）|裸眼视力右|视力右|OD视力)\s*[:：;；,，]?\s*([0-9.]+|手动|数指|指数|光感|无光感)/i);
+  out.examVisionOs = pick(/(?:左眼视力|视力\(左\)|视力（左）|裸眼视力左|视力左|OS视力)\s*[:：;；,，]?\s*([0-9.]+|手动|数指|指数|光感|无光感)/i);
+  var vpair = src.match(/视力\s*[:：;；,，]?\s*(?:右|OD)\s*([0-9.]+|手动|数指|指数|光感)\s*[，,、;；\/\s]{0,8}(?:左|OS)\s*([0-9.]+|手动|数指|指数|光感)/i);
+  if (vpair) { if (!out.examVisionOd) { out.examVisionOd = vpair[1]; } if (!out.examVisionOs) { out.examVisionOs = vpair[2]; } }
+  out.examVisionCorrOd = pick(/(?:右眼矫正视力|矫正视力\(右\)|矫正视力（右）|矫正视力右|矫正OD)\s*[:：;；,，]?\s*([0-9.]+|手动|数指|指数|光感)/i);
+  out.examVisionCorrOs = pick(/(?:左眼矫正视力|矫正视力\(左\)|矫正视力（左）|矫正视力左|矫正OS)\s*[:：;；,，]?\s*([0-9.]+|手动|数指|指数|光感)/i);
+  out.examRefractionOd = pick(/(?:右眼验光|验光\(右\)|验光右|右眼屈光|屈光右)\s*[:：;；,，]?\s*([-+0-9.DSdsC×xX*\/\s]{2,24})/);
+  out.examRefractionOs = pick(/(?:左眼验光|验光\(左\)|验光左|左眼屈光|屈光左)\s*[:：;；,，]?\s*([-+0-9.DSdsC×xX*\/\s]{2,24})/);
+  out.examIopOd = pick(/(?:右眼眼压|右眼压|眼压\(右\)|眼压（右）|眼压右|OD眼压)\s*[:：;；,，]?\s*([0-9.]{1,6})/i);
+  out.examIopOs = pick(/(?:左眼眼压|左眼压|眼压\(左\)|眼压（左）|眼压左|OS眼压)\s*[:：;；,，]?\s*([0-9.]{1,6})/i);
+  var ipair = src.match(/眼压\s*[:：;；,，]?\s*(?:右|OD)\s*([0-9.]{1,6})[^\d]{0,8}(?:左|OS)\s*([0-9.]{1,6})/i);
+  if (ipair) { if (!out.examIopOd) { out.examIopOd = ipair[1]; } if (!out.examIopOs) { out.examIopOs = ipair[2]; } }
+  out.examDetails = pickLong(/(?:专科检查|专科查体|眼科查体)\s*[:：]?\s*([\s\S]{6,500}?)(?=\s*(?:\d+\s*[、.]\s*)?(?:辅助检查|特殊检查|主要诊断|次要诊断|初步诊断|诊断|手术名称|手术日期|治疗方式|治疗方案|处理意见|医嘱|既往史|主诉|现病史|检查项目|治疗项目)|[\n\r]{2}|$)/);
+  out.auxExam = pickLong(/(?:辅助检查|特殊检查|检查结果)\s*[:：;；,，]?\s*([^\n\r]{4,220})/).replace(/^(?:(?:辅助检查|特殊检查|检查结果)\s*[:：]?\s*)+/, "");
+  out.generalAdmission = pickLong(/(?:入院情况|入院时情况|入院一般情况)\s*[:：;；,，]?\s*([^\n\r]{4,220})/);
+  out.generalAfter = pickLong(/(?:出院情况|术后一般情况|治疗后情况|出院时情况)\s*[:：;；,，]?\s*([^\n\r]{4,220})/);
+  out.anesthesia = (function () { var a = pick(/(?:麻醉方式|麻醉)\s*[:：;；,，]?\s*(表面麻醉|表麻|局部麻醉|球后麻醉|球旁麻醉|局部浸润麻醉|局部联合|全身麻醉|全麻)/); if (/表麻|表面麻醉/.test(a)) { return "表面麻醉"; } if (/局部|局麻|球后|球旁|浸润/.test(a)) { return "局麻"; } if (/全麻|全身麻醉/.test(a)) { return "全麻"; } return a; })();
+  out.surgeryRole = pick(/(?:手术角色|术中角色|担任|角色)\s*[:：;；,，]?\s*(主刀|一助|二助|三助|助手)/);
+  out.readmission = pick(/(?:是否再入院|再入院|再次入院)\s*[:：;；,，]?\s*(是|否)/);
+  out.postop = pickLong(/(?:术后处理|术后医嘱|术后用药)\s*[:：;；,，]?\s*([^\n\r]{4,220})/);
+  out.postVisionUc = pick(/(?:术后裸眼视力|术后视力)\s*[:：;；,，]?\s*([0-9.]+|手动|数指|指数|光感)/);
+  out.postVisionCorr = pick(/术后矫正视力\s*[:：;；,，]?\s*([0-9.]+|手动|数指|指数|光感)/);
+  out.postRefraction = pick(/(?:术后验光|术后屈光)\s*[:：;；,，]?\s*([-+0-9.DSdsC×xX*\/\s]{2,24})/);
+  out.postIopOd = pick(/(?:术后右眼眼压|术后右眼压)\s*[:：;；,，]?\s*([0-9.]{1,6})/);
+  out.postIopOs = pick(/(?:术后左眼眼压|术后左眼压)\s*[:：;；,，]?\s*([0-9.]{1,6})/);
+  out.postExtra = pickLong(/(?:术后其他|术后特殊情况|术后并发症)\s*[:：;；,，]?\s*([^\n\r]{4,220})/);
+  out.recordNotes = pickLong(/(?:备注|其他说明|补充说明)\s*[:：;；,，]?\s*([^\n\r]{4,220})/);
+  out.pastHistory = filterPastHistory(pickLong(/(?:既往史|既往病史|过去史)\s*[:：]?\s*([\s\S]{2,600}?)(?=\s*(?:\d+\s*[、.]\s*)?(?:入院体检|入院检查|体格检查|体检|专科检查|专科查体|眼科查体|辅助检查|特殊检查|实验室检查|主要诊断|次要诊断|初步诊断|诊断|手术名称|手术日期|治疗方式|治疗方案|处理意见|医嘱|主诉|现病史|个人史|婚育史|月经史|家族史|检查项目|治疗项目)\s*[:：]|[\n\r]{2}|$)/));
+  out.recordStatus = pick(/(?:就诊状态|状态)\s*[:：;；,，]?\s*(门诊|住院|术后随访|随访|已出院|住院中)/);
+  return out;
+}
+function ocrExtraPairs(raw) {
+  var d = ocrParseExtra(raw); ocrApplyRealExtra(d, raw);
+  return [
+    
+    ["右眼视力", "examVisionOd", d.examVisionOd],
+    ["左眼视力", "examVisionOs", d.examVisionOs],
+    ["右眼矫正视力", "examVisionCorrOd", d.examVisionCorrOd],
+    ["左眼矫正视力", "examVisionCorrOs", d.examVisionCorrOs],
+    ["右眼验光", "examRefractionOd", d.examRefractionOd],
+    ["左眼验光", "examRefractionOs", d.examRefractionOs],
+    ["右眼眼压", "examIopOd", d.examIopOd],
+    ["左眼眼压", "examIopOs", d.examIopOs],
+    ["专科查体", "examDetails", d.examDetails],
+    ["辅助检查", "auxExam", d.auxExam],
+    ["入院情况", "generalAdmission", d.generalAdmission],
+    ["治疗后情况", "generalAfter", d.generalAfter],
+    ["麻醉方式", "anesthesia", d.anesthesia],
+    ["手术角色", "surgeryRole", d.surgeryRole],
+    ["是否再入院", "readmission", d.readmission],
+    ["术后处理", "postop", d.postop],
+    ["术后视力", "postVisionUc", d.postVisionUc],
+    ["术后矫正视力", "postVisionCorr", d.postVisionCorr],
+    ["术后验光", "postRefraction", d.postRefraction],
+    ["术后右眼眼压", "postIopOd", d.postIopOd],
+    ["术后左眼眼压", "postIopOs", d.postIopOs],
+    ["术后其他", "postExtra", d.postExtra],
+    ["备注", "recordNotes", d.recordNotes], ["既往病史", "pastHistory", d.pastHistory]
+  ];
+}
+/* ---------------- 真实住院病历（首程 / 病程记录）适配 ---------------- */
+function ocrSplitDiagnoses(text) {
+  return String(text || "").split(/[;；]/).map(function (item) { return String(item).replace(/^\s*\d+\s*[.、)）]\s*/, "").trim(); }).filter(function (item) { return item.length > 1; });
+}
+function ocrDiagnosisList(src) {
+  var lines = src.split(/\n/);
+  var best = "";
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].match(/^\s*(?:\d+\s*[、.])?\s*(?:初步诊断|最后诊断|出院诊断|入院诊断|主要诊断|诊断)\s*[:：]\s*(.+)$/);
+    if (m && m[1] && m[1].replace(/\s/g, "").length > 2) { best = m[1]; break; }
+  }
+  if (!best) {
+    var m2 = src.match(/(?:主要诊断|初步诊断|出院诊断|入院诊断|诊断)\s*[:：]\s*([^\n\r]{2,200})/);
+    if (m2) { best = m2[1]; }
+  }
+  if (!best) { return []; }
+  return ocrSplitDiagnoses(best).map(function (item) { return ocrCutDiagnosis(item); }).filter(function (item) { return item.length > 1; });
+}
+function ocrApplyReal(d, raw) {
+  var src = ocrClean(raw);
+  if (!d.patientGender) { var g = src.match(/性别\s*[:：]?\s*(男|女)/) || src.match(/(男性|女性)/); if (g) { d.patientGender = /女/.test(g[1]) ? "女" : "男"; } }
+  if (!d.patientAge) { var a = src.match(/(\d{1,3})\s*(?:岁|周岁)/); if (a) { d.patientAge = a[1]; } }
+  if (/入院|住院|收入本区|收入院/.test(src)) { d.encounterType = "住院"; } else if (/门诊/.test(src) && !d.encounterType) { d.encounterType = "门诊"; }
+  var list = ocrDiagnosisList(src);
+  if (list.length) {
+    d.recordDiagnosis = list[0];
+    var extra = (d.secondary || []).concat(list.slice(1));
+    var uniq = [];
+    extra.forEach(function (x) { if (x && x !== d.recordDiagnosis && uniq.indexOf(x) < 0) { uniq.push(x); } });
+    d.secondary = uniq;
+  }
+  if (d.examDetails) { d.examDetails = ocrStripVisual(d.examDetails); }
+  var plan = src.match(/(?:治疗项目|治疗方式|治疗方案|处理意见)\s*[:：]\s*([^\n\r]{2,60})/);
+  if (plan) {
+    var p = plan[1];
+    if (/手术/.test(p)) { d.treatmentType = "手术治疗"; d.treatment = "手术治疗"; }
+    else if (/抗炎|抗感染|药物|用药|滴眼/.test(p)) { d.treatmentType = "保守治疗"; d.treatment = "药物治疗"; }
+    else if (/观察|随诊/.test(p)) { d.treatmentType = "保守治疗"; d.treatment = "观察"; }
+  }
+}
+function ocrApplyRealExtra(d, raw) {
+  var src = ocrClean(raw);
+  var first = function (re) { var m = src.match(re); return m ? m[1] : ""; };
+  var norm = function (v) { if (/^hm$/i.test(v)) { return "手动"; } if (/^fc$/i.test(v)) { return "指数"; } if (/^lp$/i.test(v)) { return "光感"; } if (/^nlp$/i.test(v)) { return "无光感"; } return v; };
+  if (!d.examVisionOd) { var a = first(/(?:Vod|VOD)\s*[:：]?\s*([0-9.]+|HM|FC|LP|NLP)/i); if (a) { d.examVisionOd = norm(a); } }
+  if (!d.examVisionOs) { var b = first(/(?:Vos|VOS)\s*[:：]?\s*([0-9.]+|HM|FC|LP|NLP)/i); if (b) { d.examVisionOs = norm(b); } }
+  if (!d.examIopOd) { var c = first(/(?:Tod|TOD)\s*[:：]?\s*([0-9.]{1,6})/); if (c) { d.examIopOd = c; } }
+  if (!d.examIopOs) { var e = first(/(?:Tos|TOS)\s*[:：]?\s*([0-9.]{1,6})/); if (e) { d.examIopOs = e; } }
+  if (!d.examDetails) { var f = first(/(?:专科检查|专科查体|眼科查体)\s*[:：]?\s*([\s\S]{6,500}?)(?=\s*(?:\d+\s*[、.]\s*)?(?:辅助检查|特殊检查|主要诊断|次要诊断|初步诊断|诊断|手术名称|手术日期|治疗方式|治疗方案|处理意见|医嘱|既往史|主诉|现病史|检查项目|治疗项目)|[\n\r]{2}|$)/); if (f) { d.examDetails = String(f).slice(0, 600); } }
+  if (d.examDetails) { d.examDetails = ocrStripVisual(d.examDetails); }
+  if (!d.auxExam) { var h = first(/(?:辅助检查)\s*[:：]?\s*([^\n\r]{6,400})/); if (h) { d.auxExam = String(h).replace(/^(?:辅助检查\s*[:：]?\s*)+/, "").slice(0, 300); } }
+}function ocrSnapshotInit() {
+  var ids = ["patientName","patientGender","patientAge","patientNo","encounterDate","encounterType","recordEye","recordStatus","attendingDoctor","recordDiagnosis","chiefComplaint","treatmentType","treatment","surgeon","surgeryName","surgeryDate","surgeryRole","anesthesia","followupDate","readmission","examVisionOd","examVisionOs","examVisionCorrOd","examVisionCorrOs","examRefractionOd","examRefractionOs","examIopOd","examIopOs","examDetails","auxExam","generalAdmission","generalAfter","postop","postVisionUc","postVisionCorr","postRefraction","postIopOd","postIopOs","postExtra","recordNotes","pastHistory"];
+  ocrInit = {};
+  ids.forEach(function (id) { var el = ocrById(id); if (el) { ocrInit[id] = String(el.value || ""); } });
+}function ocrStripVisual(s) {
+  var t = String(s || "");
+  for (var i = 0; i < 4; i++) {
+    var n = t.replace(/^(?:(?:Vod|Vos|Vou|Tod|Tos|Tou|BCVA|裸眼视力|矫正视力|右眼视力|左眼视力|右眼眼压|左眼眼压|眼压|验光|加镜)[^。；;]{0,60}[。；;]?[\s，,]*)/i, "");
+    if (n === t) { break; }
+    t = n;
+  }
+  return t.replace(/^[\s，,、;；]+/, "").trim();
+}/* 补充所见：去掉所有已单独导入的视力/眼压/验光片段（不限位置） */
+function ocrStripVisual(s) {
+  var t = String(s || "");
+  t = t.replace(/(?:Vod|Vos|Vou|VOD|VOS|Tod|Tos|Tou|TOD|TOS|BCVA|裸眼视力|矫正视力|右眼视力|左眼视力|右眼眼压|左眼眼压|眼压)\s*[:：]?\s*(?:[0-9]{1,2}(?:\.[0-9]{1,3})?|HM|FC|LP|NLP|手动|指数|光感|无光感)[^。；;]{0,24}[。；;]?/g, "");
+  for (var i = 0; i < 4; i++) {
+    var n = t.replace(/^(?:(?:验光|加镜|屈光|裸眼|矫正)[^。；;]{0,40}[。；;]?[\s，,、]*)/, "");
+    if (n === t) { break; }
+    t = n;
+  }
+  t = t.replace(/^[\s，,、;；。]+/, "").replace(/[\s]+$/, "");
+  return t.trim();
+}/* 补充所见：剔除已单独导入的视力/眼压/验光片段（按标点边界，不误删其它所见） */
+function ocrStripVisual(s) {
+  var t = String(s || "");
+  t = t.replace(/(?:Vod|Vos|Vou|Tod|Tos|Tou|BCVA|裸眼视力|矫正视力|右眼视力|左眼视力|右眼眼压|左眼眼压|眼压)\s*[:：]?\s*(?:[0-9]{1,2}(?:\.[0-9]{1,3})?|HM|FC|LP|NLP|手动|指数|光感|无光感)?[^，,。；;\n]{0,40}[，,。；;]?/g, "");
+  for (var i = 0; i < 5; i++) {
+    var n = t.replace(/^[\s，,、；;。]+/, "");
+    n = n.replace(/^(?:(?:验光|加镜|屈光|裸眼|矫正)[^，,。；;\n]{0,60}?[，,。；;])/, "");
+    if (n === t) { break; }
+    t = n;
+  }
+  return t.replace(/^[\s，,、；;。]+/, "").replace(/\s+$/, "").trim();
+}
+/* ---------------- 文本框自动高度 + 异常值标注 ---------------- */
+(function () {
+  var VISION_IDS = ["examVisionOd","examVisionOs","examVisionCorrOd","examVisionCorrOs","postVisionUc","postVisionCorr"];
+  var IOP_IDS = ["examIopOd","examIopOs","postIopOd","postIopOs"];
+  function visionLevel(v) {
+    var s = String(v || "").trim();
+    if (!s) { return ""; }
+    if (/手动|指数|光感|无光感|HM|FC|LP|NLP|眼前/.test(s)) { return "abn-sev"; }
+    var m = s.match(/\d+(?:\.\d+)?/);
+    if (!m) { return ""; }
+    var n = parseFloat(m[0]);
+    if (n >= 1) { return ""; }
+    if (n < 0.1) { return "abn-sev"; }
+    return "abn-warn";
+  }
+  function iopLevel(v) {
+    var s = String(v || "").trim();
+    if (!s) { return ""; }
+    var m = s.match(/\d+(?:\.\d+)?/);
+    if (!m) { return ""; }
+    var n = parseFloat(m[0]);
+    return (n > 21 || n < 10) ? "abn-sev" : "";
+  }
+  function markAbnormal() {
+    VISION_IDS.forEach(function (id) {
+      var e = document.getElementById(id);
+      if (!e) { return; }
+      e.classList.remove("abn-sev", "abn-warn");
+      var l = visionLevel(e.value);
+      if (l) { e.classList.add(l); }
+      e.title = l === "abn-sev" ? "视力明显异常（<0.1 或 手动/指数/光感）" : (l === "abn-warn" ? "视力偏低（<1.0）" : "");
+    });
+    IOP_IDS.forEach(function (id) {
+      var e = document.getElementById(id);
+      if (!e) { return; }
+      e.classList.remove("abn-sev");
+      var l = iopLevel(e.value);
+      if (l) { e.classList.add(l); }
+      e.title = l ? "眼压超出参考 10-21 mmHg" : "";
+    });
+  }
+  function autoGrow(el) {
+    if (!el || el.tagName !== "TEXTAREA" || (el.id !== "examDetails" && el.id !== "pastHistory")) { return; }
+    if (el.scrollHeight + 2 <= el.clientHeight + 2) { return; }
+    el.style.height = "auto";
+    var h = el.scrollHeight + 2;
+    el.style.height = (h < 36 ? 36 : h) + "px";
+  }
+  function autoGrowAll() {
+    var l = document.querySelectorAll("#examDetails, #pastHistory");
+    for (var i = 0; i < l.length; i++) { autoGrow(l[i]); } var _o = document.querySelectorAll("textarea:not(#examDetails):not(#pastHistory)"); for (var j = 0; j < _o.length; j++) { if (_o[j].style.height) { _o[j].style.height = ""; } }
+  }
+  function refresh() { autoGrowAll(); markAbnormal(); }
+  document.addEventListener("input", function (e) {
+    if (e.target && e.target.tagName === "TEXTAREA") { autoGrow(e.target); }
+    markAbnormal();
+  }, true);
+  document.addEventListener("change", function () { markAbnormal(); }, true);
+  window.addEventListener("resize", function () { autoGrowAll(); });
+  setInterval(refresh, 500);
+  setTimeout(refresh, 300);
+})();
+/* ---------------- 查体所见：阳性/阴性关键词高亮速览 ---------------- */
+(function () {
+  var BAD = ["窥不清", "窥不入", "瞳孔欠圆", "虹膜后粘连", "后粘连", "对光反射消失", "反射消失", "反射迟钝", "前房积脓", "积血", "新生血管", "视网膜脱离", "裂孔", "黄斑水肿", "角膜混浊", "玻璃体混浊", "晶状体混浊", "混浊", "浑浊", "水肿", "出血", "渗出", "溃疡", "穿孔", "胬肉", "白斑", "瘢痕", "萎缩", "变性", "增殖", "增厚", "隆起", "缺损", "偏位", "震颤", "充血", "cell", "kp", "闪辉", "白内障", "光感", "手动", "指数"];
+  var GOOD = ["未见异常", "无明显异常", "无异常", "无充血", "未充血", "透明", "房水清", "前房中深", "瞳孔圆", "反射存", "界清", "平伏", "在位", "色淡红", "正常"];
+  function escRe(w) { return w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+  function escHtml(s) { return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  function highlightExamText(raw) {
+    var s = escHtml(raw);
+    var words = GOOD.concat(BAD);
+    var goodMap = {};
+    GOOD.forEach(function (w) { goodMap[w] = 1; });
+    var re = new RegExp("(" + words.map(escRe).join("|") + ")", "g");
+    var out = "", last = 0, m;
+    while ((m = re.exec(s)) !== null) {
+      if (m.index < last) { continue; }
+      out += s.slice(last, m.index);
+      out += "<mark class=\"" + (goodMap[m[0]] ? "kw-good" : "kw-bad") + "\">" + m[0] + "</mark>";
+      last = m.index + m[0].length;
+    }
+    out += s.slice(last);
+    return out;
+  }
+  window.highlightExamText = highlightExamText;
+  var box = null, lastVal = null;
+  function ensureBox() {
+    if (box && document.body.contains(box)) { return box; }
+    var ta = document.getElementById("examDetails");
+    if (!ta) { return null; }
+    box = document.createElement("div");
+    box.className = "exam-highlight";
+    box.id = "examHighlightBox";
+    var host = (ta.closest ? ta.closest("label") : null) || ta;
+    if (host.parentNode) { host.parentNode.insertBefore(box, host.nextSibling); }
+    return box;
+  }
+  function updateBox() {
+    var ta = document.getElementById("examDetails");
+    if (!ta) { return; }
+    var b = ensureBox();
+    if (!b) { return; }
+    var v = ta.value || "";
+    if (v === lastVal) { return; }
+    lastVal = v;
+    if (!v.replace(/\s/g, "")) { b.innerHTML = ""; return; }
+    b.innerHTML = "<div class=\"exam-highlight-title\">查体速览：<span class=\"kw-bad\">红=阳性所见</span> · <span class=\"kw-good\">绿=正常/阴性</span></div><div>" + highlightExamText(v) + "</div>";
+  }
+  setInterval(updateBox, 600);
+  document.addEventListener("input", function (e) { if (e.target && e.target.id === "examDetails") { setTimeout(updateBox, 0); } }, true);
+  setTimeout(updateBox, 400);
+})();
+/* 既往病史：仅保留“有”的阳性描述与补充内容，过滤“否认/无/未”类阴性描述 */
+function filterPastHistory(s) {
+  var t = String(s || "").replace(/\s+/g, " ").trim();
+  if (!t) { return ""; }
+  var parts = t.split(/[；;。，,]/);
+  var out = [];
+  parts.forEach(function (p) {
+    var q = p.replace(/^[0-9]+\s*[、.．]\s*/, "").replace(/^[（(]\s*[0-9]+\s*[)）]\s*/, "").trim();
+    if (!q) { return; }
+    if (/^(否认|无|未|不|未见|未曾|无明显|检查无|既往体健|体健)/.test(q)) { return; }
+    out.push(q);
+  });
+  return out.join("；");
+}
+/* 总览“最近输入”排序用：兼容 ISO 创建时间，取不到则视为最旧 */
+function createdValue(v) { if (!v) { return 0; } var n = new Date(v).getTime(); return isNaN(n) ? 0 : n; }
+/* ---------------- 自动同步：电脑上的服务作为共享病例库 ---------------- */
+(function () {
+  var API = "api/records";
+  var META_KEY = STORAGE_KEY + "-sync-meta";
+  var DEL_KEY = STORAGE_KEY + "-deleted";
+  var INTERVAL = 15000;
+  var busy = false;
+  var again = false;
+
+  function stampOf(record) {
+    var value = record && record.createdAt ? new Date(record.createdAt).getTime() : 0;
+    return isNaN(value) ? 0 : value;
+  }
+  function readJson(key, fallback) {
+    try { var raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; } catch (error) { return fallback; }
+  }
+  function writeJson(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (error) {}
+  }
+  function readDeleted() { var map = readJson(DEL_KEY, {}); return map && typeof map === "object" ? map : {}; }
+  function readMeta() { var map = readJson(META_KEY, {}); return map && typeof map === "object" ? map : {}; }
+  function isSample(record) { return Boolean(record && record.id && /^r-\d{1,3}$/.test(record.id)); }
+  function storedMap() {
+    var list = readJson(STORAGE_KEY, null);
+    var map = {};
+    if (Array.isArray(list)) { list.forEach(function (row) { if (row && row.id) { map[row.id] = 1; } }); }
+    return map;
+  }
+  function setStatus(text, state) {
+    var node = document.getElementById("syncStatus");
+    if (!node) { return; }
+    node.textContent = text;
+    node.className = "sync-status" + (state ? " is-" + state : "");
+  }
+  function localDeletes(stored) {
+    var meta = readMeta();
+    var deleted = readDeleted();
+    var before = Array.isArray(meta.ids) ? meta.ids : null;
+    if (before) {
+      before.forEach(function (id) { if (!stored[id] && !deleted[id]) { deleted[id] = new Date().toISOString(); } });
+    }
+    writeJson(META_KEY, { ids: Object.keys(stored) });
+    writeJson(DEL_KEY, deleted);
+    return deleted;
+  }
+  function outgoing(stored) {
+    return records.filter(function (record) {
+      return Boolean(record && record.id && stored[record.id] && !isSample(record));
+    });
+  }
+  function applyStore(store) {
+    var incoming = store && Array.isArray(store.records) ? store.records : [];
+    var deleted = Object.assign({}, readDeleted(), (store && store.deleted) || {});
+    var byId = new Map();
+    incoming.forEach(function (record) { if (record && record.id) { byId.set(record.id, record); } });
+    records.forEach(function (record) {
+      if (!record || !record.id) { return; }
+      var current = byId.get(record.id);
+      if (!current || stampOf(record) >= stampOf(current)) { byId.set(record.id, record); }
+    });
+    Object.keys(deleted).forEach(function (id) {
+      var record = byId.get(id);
+      if (!record) { return; }
+      var when = new Date(deleted[id]).getTime();
+      if (!isNaN(when) && stampOf(record) <= when) { byId.delete(id); }
+    });
+    var fresh = Array.from(byId.values());
+    var hasLocalData = Object.keys(storedMap()).length > 0;
+    if (!incoming.length) { fresh = records.slice(); }
+    if (!hasLocalData && incoming.length) {
+      fresh = fresh.filter(function (record) { return !isSample(record); });
+    }
+    var before = JSON.stringify(records);
+    records = fresh;
+    writeJson(DEL_KEY, deleted);
+    return JSON.stringify(records) !== before;
+  }
+  function syncNow(manual) {
+    if (busy) { again = true; return; }
+    busy = true;
+    if (manual) { setStatus("同步中…", "busy"); }
+    var stored = storedMap();
+    var deleted = localDeletes(stored);
+    var payload = { records: outgoing(stored), deleted: deleted };
+    fetch(API, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), cache: "no-store" })
+      .then(function (response) { if (!response.ok) { throw new Error("HTTP " + response.status); } return response.json(); })
+      .then(function (store) {
+        var changed = applyStore(store);
+        if (changed) { saveRecords(); renderAll(); }
+        setStatus("已同步", "ok");
+        if (manual) { toast("已与病例库同步"); }
+      })
+      .catch(function () {
+        setStatus("未连接（仅本机）", "off");
+        if (manual) { toast("没连上病例库：先存在本机，回到同一网络会自动补上"); }
+      })
+      .then(function () { busy = false; if (again) { again = false; syncNow(false); } });
+  }
+  window.addEventListener("load", function () {
+    setStatus("正在连接…", "busy");
+    setTimeout(function () { syncNow(false); }, 1200);
+  });
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) { syncNow(false); } });
+  setInterval(function () { if (!document.hidden) { syncNow(false); } }, INTERVAL);
+  document.addEventListener("click", function (event) {
+    var node = event.target;
+    while (node && node !== document) { if (node.id === "syncStatus") { syncNow(true); return; } node = node.parentNode; }
+  });
+
+  /* 保存后尽快推送到共享病例库（防抖） */
+  var saveTimer = null;
+  var baseSaveRecords = saveRecords;
+  saveRecords = function () {
+    baseSaveRecords.apply(null, arguments);
+    if (saveTimer) { clearTimeout(saveTimer); }
+    saveTimer = setTimeout(function () { saveTimer = null; syncNow(false); }, 900);
+  };
+  window.__visionSyncNow = syncNow;})();
